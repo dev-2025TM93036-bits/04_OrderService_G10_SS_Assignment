@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
@@ -109,6 +109,10 @@ class OrderCreate(BaseModel):
     address_id: int
     items: list[RequestedItem]
     payment: PaymentPayload
+
+
+class OrderStatusUpdate(BaseModel):
+    order_status: str
 
 
 class OrderItemOut(BaseModel):
@@ -314,3 +318,38 @@ def cancel_order(order_id: int, db: Session = Depends(get_db)):
     order.order_status = "CANCELLED"
     db.commit()
     return {"order_id": order.order_id, "order_status": order.order_status}
+
+
+@app.patch("/v1/orders/{order_id}", response_model=OrderOut)
+def update_order_status(order_id: int, payload: OrderStatusUpdate, db: Session = Depends(get_db)):
+    order = db.get(Order, order_id)
+    if not order:
+        raise ApiError("ORDER_NOT_FOUND", f"Order {order_id} not found", 404)
+    new_status = payload.order_status.upper()
+    allowed = {
+        "CREATED": {"CONFIRMED", "CANCELLED", "PAYMENT_FAILED"},
+        "CONFIRMED": {"CANCELLED"},
+        "PAYMENT_FAILED": {"CANCELLED"},
+        "CANCELLED": set(),
+        "DELIVERED": set(),
+    }
+    if new_status not in allowed.get(order.order_status, set()):
+        raise ApiError("INVALID_ORDER_TRANSITION", f"Cannot move from {order.order_status} to {new_status}", 409)
+    order.order_status = new_status
+    db.commit()
+    db.refresh(order)
+    return order
+
+
+@app.delete("/v1/orders/{order_id}", status_code=204)
+def delete_order(order_id: int, db: Session = Depends(get_db)):
+    order = db.get(Order, order_id)
+    if not order:
+        raise ApiError("ORDER_NOT_FOUND", f"Order {order_id} not found", 404)
+    if order.order_status != "CANCELLED":
+        raise ApiError("ORDER_DELETE_BLOCKED", "Only cancelled orders can be deleted", 409)
+    db.query(OrderItem).filter(OrderItem.order_id == order_id).delete()
+    db.query(OrderRequest).filter(OrderRequest.order_id == order_id).delete()
+    db.delete(order)
+    db.commit()
+    return Response(status_code=204)
