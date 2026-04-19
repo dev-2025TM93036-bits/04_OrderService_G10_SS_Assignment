@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
-from sqlalchemy import DateTime, Float, Integer, String, create_engine
+from sqlalchemy import DateTime, Float, Integer, String, create_engine, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "order-service")
@@ -143,6 +143,10 @@ def get_db():
         db.close()
 
 
+def next_id(db: Session, model, column) -> int:
+    return (db.query(func.max(column)).scalar() or 0) + 1
+
+
 def parse_dt(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
 
@@ -267,7 +271,7 @@ async def create_order(payload: OrderCreate, request: Request, db: Session = Dep
     tax_amount = round(subtotal * 0.05, 2)
     order_total = round(subtotal + tax_amount + DELIVERY_FEE, 2)
 
-    order = Order(customer_id=payload.customer_id, restaurant_id=payload.restaurant_id, restaurant_name=availability["restaurant"]["name"], address_id=payload.address_id, address_city=address["city"], order_status="CREATED", subtotal=subtotal, tax_amount=tax_amount, delivery_fee=DELIVERY_FEE, order_total=order_total, payment_status="PENDING", created_at=datetime.utcnow())
+    order = Order(order_id=next_id(db, Order, Order.order_id), customer_id=payload.customer_id, restaurant_id=payload.restaurant_id, restaurant_name=availability["restaurant"]["name"], address_id=payload.address_id, address_city=address["city"], order_status="CREATED", subtotal=subtotal, tax_amount=tax_amount, delivery_fee=DELIVERY_FEE, order_total=order_total, payment_status="PENDING", created_at=datetime.utcnow())
     db.add(order)
     db.flush()
 
@@ -275,9 +279,10 @@ async def create_order(payload: OrderCreate, request: Request, db: Session = Dep
     order.order_status = "CONFIRMED" if payment["status"] in {"SUCCESS", "PENDING"} else "PAYMENT_FAILED"
     order.payment_status = payment["status"]
 
-    for snapshot in availability["items"]:
-        db.add(OrderItem(order_id=order.order_id, item_id=snapshot["item_id"], item_name=snapshot["name"], quantity=snapshot["quantity"], price=snapshot["price"]))
-    db.add(OrderRequest(idempotency_key=idempotency_key, order_id=order.order_id, created_at=datetime.utcnow()))
+    next_order_item_id = next_id(db, OrderItem, OrderItem.order_item_id)
+    for offset, snapshot in enumerate(availability["items"]):
+        db.add(OrderItem(order_item_id=next_order_item_id + offset, order_id=order.order_id, item_id=snapshot["item_id"], item_name=snapshot["name"], quantity=snapshot["quantity"], price=snapshot["price"]))
+    db.add(OrderRequest(request_id=next_id(db, OrderRequest, OrderRequest.request_id), idempotency_key=idempotency_key, order_id=order.order_id, created_at=datetime.utcnow()))
     db.commit()
     db.refresh(order)
 
